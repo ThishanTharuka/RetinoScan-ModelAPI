@@ -1,0 +1,22 @@
+# Core FastAPI dependencies
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+pydantic
+
+# Image processing
+pillow
+opencv-python
+numpy
+
+# Machine learning
+torch
+torchvision
+timm
+albumentations
+scikit-learn
+
+# Optional security (can be installed separately if needed)
+# python-jose[cryptography]
+# passlib[bcrypt]
