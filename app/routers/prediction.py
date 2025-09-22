@@ -1,5 +1,7 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+import os
+import base64
 from app.models.schemas import (
     PredictionRequest, 
     PredictionResponse, 
@@ -7,6 +9,7 @@ from app.models.schemas import (
 )
 from app.services.model_service import ModelService
 from app.services.image_service import ImageService
+from app.services.interpretability import GradCAM, overlay_heatmap_on_image
 from app.utils.logger import get_logger
 import time
 
@@ -209,3 +212,89 @@ async def predict_from_upload(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         ) from e
+
+
+@router.post("/interpret/gradcam")
+async def interpret_gradcam(request: PredictionRequest | None = None, file: UploadFile | None = None):
+    """
+    Generate a Grad-CAM heatmap overlay for a provided retinal image.
+
+    Accepts either a JSON body with base64 `image_base64` (PredictionRequest)
+    or a multipart upload file. Returns a base64 PNG overlay.
+    """
+    try:
+        model_service = ModelService.get_instance()
+        image_service = ImageService()
+
+        if not model_service.is_model_loaded():
+            raise HTTPException(status_code=503, detail="Model not loaded")
+
+        # Load image from either request body or uploaded file
+        if file is not None:
+            image_bytes = await file.read()
+            image = image_service.decode_image_bytes(image_bytes)
+        elif request is not None and getattr(request, 'image_base64', None):
+            image = image_service.decode_base64_image(request.image_base64)
+        else:
+            raise HTTPException(status_code=400, detail="No image provided")
+
+        # Validate and preprocess (we want original sized image for overlay, but use preprocess for model)
+        if not image_service.validate_image(image):
+            raise HTTPException(status_code=400, detail="Invalid image data")
+
+        preprocessed = image_service.preprocess_image(image)
+
+        # Instantiate GradCAM with underlying PyTorch model
+        gradcam = GradCAM(model_service._model)
+
+        # Generate CAM on the preprocessed image (note: preprocessed is normalized)
+        # convert back to RGB uint8 expected by GradCAM helper
+        try:
+            # If preprocessed values are normalized floats (C,H,W converted to H,W,C), rescale to 0-255
+            img_for_cam = (preprocessed * 255.0).astype('uint8') if preprocessed.max() <= 1.0 else preprocessed.astype('uint8')
+        except Exception:
+            img_for_cam = preprocessed.astype('uint8')
+
+        cam = gradcam.generate_cam(img_for_cam)
+
+        # Overlay heatmap on the resized image used for model (makes visual alignment easier)
+        overlay_b64 = overlay_heatmap_on_image(img_for_cam, cam, alpha=0.5)
+
+        return JSONResponse(status_code=200, content={"status": "success", "heatmap": overlay_b64})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("GradCAM endpoint error: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"GradCAM failed: {str(e)}") from e
+
+
+@router.get("/interpret/heatmap/latest")
+async def get_latest_heatmap():
+    """
+    Return the most recently generated heatmap image (if present) as a data URL.
+    This is useful for quick frontend previewing when a heatmap was generated on the server
+    and saved to a known path (heatmap_output.png in the project root).
+    """
+    try:
+        # Save path is relative to the repository root (model-api/heatmap_output.png)
+        repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        heatmap_path = os.path.join(repo_root, 'heatmap_output.png')
+        if not os.path.exists(heatmap_path):
+            raise HTTPException(status_code=404, detail="No heatmap found")
+
+        # Read file in threadpool to avoid blocking the event loop
+        import asyncio
+        loop = asyncio.get_running_loop()
+        def _read():
+            with open(heatmap_path, 'rb') as fh:
+                return fh.read()
+
+        data = await loop.run_in_executor(None, _read)
+        b64 = base64.b64encode(data).decode('ascii')
+        return JSONResponse(status_code=200, content={"status": "success", "heatmap": f"data:image/png;base64,{b64}"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error returning latest heatmap: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to return latest heatmap: {str(e)}") from e
