@@ -73,6 +73,9 @@ class ImageService:
             
             # Convert to PIL Image
             image = Image.open(io.BytesIO(image_data))
+
+            # Auto-resize/convert large or problematic images to acceptable limits
+            image = self._ensure_acceptable_image(image)
             
             # Convert to RGB if necessary
             if image.mode != 'RGB':
@@ -105,6 +108,9 @@ class ImageService:
             
             # Convert to PIL Image
             image = Image.open(io.BytesIO(image_bytes))
+
+            # Auto-resize/convert large or problematic images to acceptable limits
+            image = self._ensure_acceptable_image(image)
             
             # Convert to RGB if necessary
             if image.mode != 'RGB':
@@ -231,3 +237,58 @@ class ImageService:
             "max_value": float(np.max(image)),
             "mean_value": float(np.mean(image))
         }
+
+    def _ensure_acceptable_image(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Ensure a PIL Image is within file size and dimension constraints.
+
+        If the image dimensions exceed the maximum allowed by the service
+        or the in-memory JPEG representation is too large, downscale the
+        image and re-encode to JPEG in-memory with reasonable quality.
+
+        Returns a PIL.Image (RGB).
+        """
+        try:
+            # Ensure RGB
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+
+            # Quick dimension check
+            w, h = pil_image.size
+            max_dim = 3000  # chosen conservative max side to keep quality
+            if max(w, h) > max_dim:
+                ratio = max_dim / float(max(w, h))
+                new_size = (int(w * ratio), int(h * ratio))
+                pil_image = pil_image.resize(new_size, Image.LANCZOS)
+
+            # Re-encode to JPEG in-memory and check size
+            buf = io.BytesIO()
+            pil_image.save(buf, format='JPEG', quality=92)
+            size_bytes = buf.tell()
+
+            # If still too large, progressively reduce quality
+            quality = 92
+            while size_bytes > self.max_file_size and quality >= 50:
+                buf = io.BytesIO()
+                quality -= 8
+                pil_image.save(buf, format='JPEG', quality=quality)
+                size_bytes = buf.tell()
+
+            # If we've reduced quality below threshold and still too large,
+            # scale down further until it fits or minimal quality reached
+            while size_bytes > self.max_file_size:
+                w, h = pil_image.size
+                new_size = (int(w * 0.85), int(h * 0.85))
+                pil_image = pil_image.resize(new_size, Image.LANCZOS)
+                buf = io.BytesIO()
+                pil_image.save(buf, format='JPEG', quality=quality)
+                size_bytes = buf.tell()
+
+            # Return PIL Image (already RGB)
+            return pil_image
+        except Exception as e:
+            logger.warning(f"_ensure_acceptable_image failed: {str(e)}; returning original image")
+            try:
+                return pil_image.convert('RGB')
+            except Exception:
+                return pil_image
